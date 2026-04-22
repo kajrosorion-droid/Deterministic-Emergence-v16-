@@ -1,0 +1,741 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import hashlib
+from scipy.ndimage import label, find_objects
+
+# =============================================================================
+# 832 Protocol v34 — ECOSYSTEM & NICHE SELECTION (fixed)
+# =============================================================================
+
+def stable_hash(*args):
+    h = hashlib.sha256(str(args).encode()).hexdigest()
+    return int(h[:8], 16)
+
+def sh_rand(*args):
+    return (stable_hash(*args) % 1000000) / 1000000.0
+
+def sh_randn(*args):
+    u1 = sh_rand(*args, 1)
+    u2 = sh_rand(*args, 2)
+    return np.sqrt(-2 * np.log(u1 + 1e-9)) * np.cos(2 * np.pi * u2)
+
+def symmetric_part(M):
+    return 0.5 * (M + M.T)
+
+def antisymmetric_part(M):
+    return 0.5 * (M - M.T)
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+N_AGENTS = 15
+STATE_DIM = 3
+STEPS = 3000
+WORLD_SIZE = 10
+
+ETA = 0.005
+DECAY_S = 0.999
+DECAY_A = 0.995
+NOISE = 0.005
+RESONANCE_THRESHOLD = 0.7
+TARGET_FLOW = 0.5
+
+VORTEX_STRENGTH_MIN = 0.2
+VORTEX_STRENGTH_MAX = 1.5
+VORTEX_MERGE_DIST = 2.0
+VORTEX_STABILITY_THRESHOLD = 0.3
+
+FIELD_ENERGY_MAX = 20.0
+FIELD_ENERGY_REGEN = 0.05
+VORTEX_METABOLIC_BASE = 0.1
+
+DIVIDE_ENERGY_THRESHOLD = 5.0
+DIVIDE_MIN_AGE = 10
+DIVIDE_CELLS_FRACTION = 0.4
+MUTATION_RATE = 0.1
+
+# =============================================================================
+# BIOME SYSTEM
+# =============================================================================
+
+N_BIOMES = 3
+
+BIOME_PARAMS = [
+    {"growth": 1.2, "cost": 0.8, "noise": 1.3, "color": "lightgreen"}, # fertile
+    {"growth": 1.0, "cost": 1.0, "noise": 1.0, "color": "lightgray"},  # neutral
+    {"growth": 0.7, "cost": 1.5, "noise": 0.6, "color": "lightcoral"}, # harsh
+]
+
+# =============================================================================
+# AGENT
+# =============================================================================
+
+class Agent:
+    def __init__(self, agent_id, pos):
+        self.id = agent_id
+        self.pos = np.array(pos, dtype=int)
+        self.state = np.array([sh_randn(agent_id, i) for i in range(STATE_DIM)])
+
+    def move(self, step, field):
+        x, y = self.pos
+        dom = field.get_smoothed_dominant_eigenvector(x, y)
+        noise_dir = np.array([sh_randn(self.id, step, i) for i in range(STATE_DIM)])
+        dom = dom + 0.15 * noise_dir
+        dom = dom / (np.linalg.norm(dom) + 1e-9)
+        bias = np.tanh(4.0 * dom[0])
+        d = stable_hash(self.id, step, "move") % 4
+
+        if abs(bias) > sh_rand(self.id, step):
+            if bias > 0:
+                if d in (1, 3) and self.pos[0] < WORLD_SIZE-1:
+                    self.pos[0] += 1
+                elif d in (0, 2) and self.pos[1] < WORLD_SIZE-1:
+                    self.pos[1] += 1
+            else:
+                if d in (1, 3) and self.pos[0] > 0:
+                    self.pos[0] -= 1
+                elif d in (0, 2) and self.pos[1] > 0:
+                    self.pos[1] -= 1
+        else:
+            if d == 0 and self.pos[1] > 0:
+                self.pos[1] -= 1
+            elif d == 1 and self.pos[1] < WORLD_SIZE-1:
+                self.pos[1] += 1
+            elif d == 2 and self.pos[0] > 0:
+                self.pos[0] -= 1
+            elif d == 3 and self.pos[0] < WORLD_SIZE-1:
+                self.pos[0] += 1
+
+# =============================================================================
+# VORTEX ENTITY
+# =============================================================================
+
+class Vortex:
+    def __init__(self, vid, cells, field_S, field_A, parent=None):
+        self.id = vid
+        self.cells = set(cells)
+        self.age = 0
+        self.alive = True
+
+        if parent is None:
+            self.lineage_id = vid
+            self.parent_id = 0
+            self.generation = 0
+            self.genome = {
+                'replication_threshold': DIVIDE_ENERGY_THRESHOLD * (0.8 + 0.4 * sh_rand(vid, 1)),
+                'aggression': 0.5 + 0.3 * (sh_rand(vid, 2) - 0.5),
+                'metabolic_cost': 0.1 + 0.05 * (sh_rand(vid, 3) - 0.5),
+                'mutation_rate': MUTATION_RATE * (0.5 + sh_rand(vid, 4)),
+                'niche_preference': np.array([sh_rand(vid, 10+i) for i in range(N_BIOMES)]),
+            }
+        else:
+            self.lineage_id = parent.lineage_id
+            self.parent_id = parent.id
+            self.generation = parent.generation + 1
+            self.genome = parent.genome.copy()
+            pref = self.genome['niche_preference'].copy()
+            for i in range(N_BIOMES):
+                mutation = self.genome['mutation_rate'] * (sh_rand(vid, 20+i) - 0.5)
+                pref[i] = max(0.0, min(1.0, pref[i] + mutation))
+            self.genome['niche_preference'] = pref
+            for key in ['replication_threshold', 'aggression', 'metabolic_cost', 'mutation_rate']:
+                mutation = self.genome['mutation_rate'] * (sh_rand(vid, key) - 0.5)
+                self.genome[key] = max(0.3, min(2.0, self.genome[key] + mutation))
+
+        self.children_count = 0
+        self.energy_spent = 0.0
+        self.mass = 0.0
+        self.momentum = np.zeros(STATE_DIM)
+        self.energy = 0.0
+        self.stability = 0.0
+        self.center = np.zeros(2)
+        self.update_properties(field_S, field_A)
+
+    def update_properties(self, field_S, field_A):
+        if not self.cells:
+            self.alive = False
+            return
+        xs = [c[0] for c in self.cells]
+        ys = [c[1] for c in self.cells]
+        self.center = np.array([np.mean(xs), np.mean(ys)])
+        self.mass = sum(np.linalg.norm(field_A[c]) for c in self.cells)
+        self.momentum = np.zeros(STATE_DIM)
+        for c in self.cells:
+            self.momentum += antisymmetric_part(field_A[c]) @ np.ones(STATE_DIM)
+        self.energy = sum(np.linalg.norm(field_S[c] + field_A[c]) for c in self.cells)
+        self.stability = self.mass * np.linalg.norm(self.momentum)
+
+    def niche_fit(self, biome_id):
+        return 0.5 + self.genome['niche_preference'][biome_id]
+
+    def metabolic_tax(self, field_energy, biome_map):
+        cost_per_cell = self.genome['metabolic_cost'] * (1 + 0.05 * self.age)
+        total_cost = 0
+        for (x,y) in self.cells:
+            biome = biome_map[x,y]
+            biome_cost_factor = BIOME_PARAMS[biome]["cost"]
+            available = field_energy[x,y]
+            take = min(available, cost_per_cell * biome_cost_factor)
+            field_energy[x,y] -= take
+            total_cost += take
+        if total_cost < cost_per_cell * len(self.cells) * 0.5:
+            self.stability *= 0.95
+        return total_cost
+
+    def can_divide(self):
+        return (self.energy > self.genome['replication_threshold'] and
+                self.age > DIVIDE_MIN_AGE and
+                len(self.cells) >= 4 and
+                self.alive)
+
+    def divide(self, field_S, field_A, field_energy, next_id):
+        if not self.can_divide():
+            return None
+        cells_list = list(self.cells)
+        cells_list.sort(key=lambda c: np.linalg.norm(np.array(c) - self.center), reverse=True)
+        n_child = max(2, int(len(cells_list) * DIVIDE_CELLS_FRACTION))
+        child_cells = set(cells_list[:n_child])
+        self.cells = set(cells_list[n_child:])
+        energy_share = n_child / (n_child + len(self.cells))
+        child_energy = self.energy * energy_share
+        self.energy -= child_energy
+        self.energy_spent += child_energy
+        child = Vortex(next_id, child_cells, field_S, field_A, parent=self)
+        child.energy = child_energy
+        self.children_count += 1
+        self.update_properties(field_S, field_A)
+        return child
+
+    def compete(self, other, field_S, field_A, biome_map):
+        overlap = self.cells & other.cells
+        if not overlap:
+            return
+        my_fit = np.mean([self.niche_fit(biome_map[x,y]) for (x,y) in overlap])
+        other_fit = np.mean([other.niche_fit(biome_map[x,y]) for (x,y) in overlap])
+        my_power = self.genome['aggression'] * self.energy * my_fit
+        other_power = other.genome['aggression'] * other.energy * other_fit
+        if my_power > other_power:
+            winner, loser = self, other
+        else:
+            winner, loser = other, self
+        for cell in overlap:
+            if sh_rand(cell[0], cell[1], self.id) < 0.7:
+                loser.cells.discard(cell)
+                winner.cells.add(cell)
+        winner.update_properties(field_S, field_A)
+        loser.update_properties(field_S, field_A)
+        loser.energy *= 0.9
+
+    def should_die(self):
+        if not self.alive:
+            return True
+        if self.stability < VORTEX_STABILITY_THRESHOLD:
+            return True
+        if len(self.cells) < 2:
+            return True
+        if self.age > 50 and self.children_count == 0 and self.energy < self.genome['replication_threshold']:
+            return True
+        return False
+
+# =============================================================================
+# FIELD
+# =============================================================================
+
+class Field:
+    def __init__(self):
+        self.S = np.zeros((WORLD_SIZE, WORLD_SIZE, STATE_DIM, STATE_DIM))
+        self.A = np.zeros((WORLD_SIZE, WORLD_SIZE, STATE_DIM, STATE_DIM))
+        self.field_energy = np.ones((WORLD_SIZE, WORLD_SIZE)) * FIELD_ENERGY_MAX
+        self.biome_map = np.zeros((WORLD_SIZE, WORLD_SIZE), dtype=int)
+        for x in range(WORLD_SIZE):
+            for y in range(WORLD_SIZE):
+                self.biome_map[x,y] = stable_hash(x, y) % N_BIOMES
+        rm = np.array([[sh_randn(x,y,i,j) for j in range(STATE_DIM)] for i in range(STATE_DIM)])
+        self.S[x,y] = symmetric_part(rm) * 0.05
+        self.A[x,y] = antisymmetric_part(rm) * 0.02
+        self.eco_memory = np.zeros((WORLD_SIZE, WORLD_SIZE))
+        self.vortices = []
+        self.vortex_id_counter = 1
+        self.vortex_grid = np.zeros((WORLD_SIZE, WORLD_SIZE), dtype=int)
+
+    def apply(self, pos, state):
+        x, y = pos
+        M = self.S[x,y] + self.A[x,y]
+        if not np.isfinite(M).all():
+            M = np.eye(STATE_DIM) * 0.01
+            self.S[x,y] = symmetric_part(M)
+            self.A[x,y] = antisymmetric_part(M)
+        return M @ state
+
+    def get_dominant_eigenvector(self, x, y):
+        M = self.S[x,y] + self.A[x,y]
+        if not np.isfinite(M).all():
+            return np.ones(STATE_DIM) / np.sqrt(STATE_DIM)
+        try:
+            eigvals, eigvecs = np.linalg.eig(M)
+            idx = np.argmax(np.real(eigvals))
+            v = np.real(eigvecs[:, idx])
+            norm = np.linalg.norm(v)
+            return v / norm if norm > 0 else np.ones(STATE_DIM)/np.sqrt(STATE_DIM)
+        except:
+            return np.ones(STATE_DIM) / np.sqrt(STATE_DIM)
+
+    def get_smoothed_dominant_eigenvector(self, x, y):
+        vectors = []
+        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+            nx, ny = x+dx, y+dy
+            if 0 <= nx < WORLD_SIZE and 0 <= ny < WORLD_SIZE:
+                vectors.append(self.get_dominant_eigenvector(nx, ny))
+        local = self.get_dominant_eigenvector(x, y)
+        if vectors:
+            avg_neighbors = np.mean(vectors, axis=0)
+            avg = 0.6 * local + 0.4 * avg_neighbors
+        else:
+            avg = local
+        norm = np.linalg.norm(avg)
+        return avg / norm if norm > 0 else local
+
+    def _normalize_flow(self, flow):
+        norm = np.linalg.norm(flow)
+        if norm > 1.0:
+            flow = flow / norm
+        return flow
+
+    def _balance(self, x, y):
+        s_norm = np.linalg.norm(self.S[x,y])
+        a_norm = np.linalg.norm(self.A[x,y])
+        if a_norm > 1e-9:
+            ratio = s_norm / a_norm
+            if ratio < 1.5:
+                self.S[x,y] *= 1.02
+            elif ratio > 3.0:
+                self.A[x,y] *= 1.02
+
+    def _cap_energy(self, x, y):
+        M = self.S[x,y] + self.A[x,y]
+        norm = np.linalg.norm(M)
+        if norm > 12.0:
+            self.S[x,y] *= 0.995
+            self.A[x,y] *= 0.995
+
+    def _regulate_flow(self, x, y):
+        current_flow = np.linalg.norm(self.A[x,y])
+        error = current_flow - TARGET_FLOW
+        self.A[x,y] *= (1.0 - 0.005 * error)
+
+    def _pressure_release(self, x, y):
+        s_norm = np.linalg.norm(self.S[x,y])
+        a_norm = np.linalg.norm(self.A[x,y])
+        if s_norm > 5.0 and a_norm < 0.6:
+            asym_S = antisymmetric_part(self.S[x,y])
+            self.A[x,y] += 0.015 * asym_S
+            self.S[x,y] *= 0.99
+
+    def _coherence_feedback(self, x, y, local_states):
+        if not local_states:
+            return
+        norms = [np.linalg.norm(s) for s in local_states if np.linalg.norm(s) > 0]
+        if not norms:
+            return
+        coh = np.mean(norms)
+        error = 0.5 - coh
+        damping = 1.0 - 0.02 * max(0, error)
+        self.A[x,y] *= damping
+
+    def _detect_raw_vortices(self):
+        strength = np.zeros((WORLD_SIZE, WORLD_SIZE))
+        for x in range(WORLD_SIZE):
+            for y in range(WORLD_SIZE):
+                curl = antisymmetric_part(self.A[x,y])
+                strength[x,y] = np.linalg.norm(curl)
+        mask = (strength > VORTEX_STRENGTH_MIN) & (strength < VORTEX_STRENGTH_MAX)
+        labeled, num = label(mask)
+        slices = find_objects(labeled)
+        components = []
+        for i, slc in enumerate(slices, 1):
+            if slc is None:
+                continue
+            region = labeled[slc] == i
+            cells = set()
+            for dx in range(slc[0].start, slc[0].stop):
+                for dy in range(slc[1].start, slc[1].stop):
+                    if region[dx - slc[0].start, dy - slc[1].start]:
+                        cells.add((dx, dy))
+            if cells:
+                components.append(cells)
+        return components
+
+    def _build_vortices(self):
+        raw_components = self._detect_raw_vortices()
+        self.vortex_grid.fill(0)
+        new_vortices = []
+        used_ids = set()
+        for cells in raw_components:
+            best_v = None
+            best_overlap = 0
+            for v in self.vortices:
+                if not v.alive:
+                    continue
+                overlap = len(cells & v.cells)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_v = v
+            if best_v and best_overlap > len(cells) * 0.3:
+                best_v.cells = cells
+                best_v.update_properties(self.S, self.A)
+                best_v.age += 1
+                new_vortices.append(best_v)
+                used_ids.add(best_v.id)
+            else:
+                vid = self.vortex_id_counter
+                self.vortex_id_counter += 1
+                v = Vortex(vid, cells, self.S, self.A, parent=best_v)
+                new_vortices.append(v)
+                used_ids.add(vid)
+        for v in self.vortices:
+            if v.id not in used_ids:
+                v.alive = False
+        self.vortices = new_vortices
+        for v in self.vortices:
+            for (x,y) in v.cells:
+                self.vortex_grid[x,y] = v.id
+
+    def _vortex_interactions(self):
+        alive = [v for v in self.vortices if v.alive]
+        for i, v1 in enumerate(alive):
+            for v2 in alive[i+1:]:
+                if v1.cells & v2.cells:
+                    v1.compete(v2, self.S, self.A, self.biome_map)
+        alive = [v for v in self.vortices if v.alive]
+        alive.sort(key=lambda v: v.mass, reverse=True)
+        merged = set()
+        for i, v1 in enumerate(alive):
+            if v1.id in merged:
+                continue
+            for v2 in alive[i+1:]:
+                if v2.id in merged:
+                    continue
+                overlap = len(v1.cells & v2.cells)
+                if overlap > len(v2.cells) * 0.7:
+                    v1.cells.update(v2.cells)
+                    v2.alive = False
+                    merged.add(v2.id)
+                    v1.update_properties(self.S, self.A)
+        self.vortices = [v for v in self.vortices if v.alive]
+
+    def _vortex_lifecycle(self):
+        self._build_vortices()
+        self._vortex_interactions()
+        for v in self.vortices:
+            v.metabolic_tax(self.field_energy, self.biome_map)
+        newborns = []
+        for v in self.vortices:
+            if v.can_divide():
+                child = v.divide(self.S, self.A, self.field_energy, self.vortex_id_counter)
+                if child:
+                    newborns.append(child)
+                    self.vortex_id_counter += 1
+        self.vortices.extend(newborns)
+        for v in self.vortices:
+            biome_fits = [v.niche_fit(self.biome_map[x,y]) for (x,y) in v.cells]
+            avg_fit = np.mean(biome_fits) if biome_fits else 1.0
+            fitness = v.energy * v.genome['aggression'] * avg_fit
+            if v.should_die() or fitness < 1.0:
+                for (x,y) in v.cells:
+                    self.field_energy[x,y] = min(FIELD_ENERGY_MAX, self.field_energy[x,y] + 0.5 * v.mass)
+                    self.A[x,y] += 0.05 * antisymmetric_part(np.random.randn(STATE_DIM, STATE_DIM))
+                    self.eco_memory[x,y] += v.mass * 0.01
+                v.alive = False
+            else:
+                for (x,y) in v.cells:
+                    biome = self.biome_map[x,y]
+                    growth_factor = BIOME_PARAMS[biome]["growth"]
+                    boost = 1.0 + 0.005 * v.stability * (1.0 - v.genome['metabolic_cost']) * growth_factor
+                    if self.field_energy[x,y] > 0.1:
+                        self.A[x,y] *= min(1.02, boost)
+                        self.field_energy[x,y] -= 0.01 * v.genome['metabolic_cost']
+        self.vortices = [v for v in self.vortices if v.alive]
+        self.vortex_grid.fill(0)
+        for v in self.vortices:
+            for (x,y) in v.cells:
+                self.vortex_grid[x,y] = v.id
+
+    def _regen_field_energy(self):
+        self.field_energy += FIELD_ENERGY_REGEN
+        np.clip(self.field_energy, 0, FIELD_ENERGY_MAX, out=self.field_energy)
+
+    def update_normal(self, pos, outer, local_states):
+        x, y = pos
+        if not np.isfinite(outer).all() or self.field_energy[x,y] < 0.05:
+            return
+        biome = self.biome_map[x,y]
+        noise_scale = BIOME_PARAMS[biome]["noise"]
+        self.S[x,y] += ETA * outer
+        self.S[x,y] *= DECAY_S
+        asym = np.array([[sh_randn(x,y,i,j) for j in range(STATE_DIM)] for i in range(STATE_DIM)])
+        self.A[x,y] += ETA * 0.4 * noise_scale * antisymmetric_part(asym)
+        self.A[x,y] *= DECAY_A
+        flow = antisymmetric_part(self.A[x,y])
+        flow = self._normalize_flow(flow)
+        self.S[x,y] += ETA * 0.2 * (flow @ flow.T)
+        self.A[x,y] += ETA * 0.05 * antisymmetric_part(self.S[x,y])
+        self._pressure_release(x, y)
+        self._cap_energy(x, y)
+        self._balance(x, y)
+        self._regulate_flow(x, y)
+        self._coherence_feedback(x, y, local_states)
+        self.field_energy[x,y] -= 0.01
+
+    def update_resonance(self, pos, state, local_states):
+        x, y = pos
+        if self.field_energy[x,y] < 0.05:
+            return
+        biome = self.biome_map[x,y]
+        noise_scale = BIOME_PARAMS[biome]["noise"]
+        dom = self.get_smoothed_dominant_eigenvector(x, y)
+        outer_aligned = np.outer(state, dom) + np.outer(dom, state)
+        self.S[x,y] += ETA * 1.5 * outer_aligned
+        self.S[x,y] = symmetric_part(self.S[x,y])
+        self.S[x,y] *= DECAY_S
+        rot_noise = np.array([[sh_randn(x,y,i,j) for j in range(STATE_DIM)] for i in range(STATE_DIM)])
+        self.A[x,y] += ETA * 0.1 * noise_scale * antisymmetric_part(rot_noise)
+        self.A[x,y] *= DECAY_A
+        flow = antisymmetric_part(self.A[x,y])
+        flow = self._normalize_flow(flow)
+        self.S[x,y] += ETA * 0.2 * (flow @ flow.T)
+        self.A[x,y] += ETA * 0.05 * antisymmetric_part(self.S[x,y])
+        self._pressure_release(x, y)
+        self._cap_energy(x, y)
+        self._balance(x, y)
+        self._regulate_flow(x, y)
+        self._coherence_feedback(x, y, local_states)
+        self.field_energy[x,y] -= 0.02
+
+    def diffuse(self):
+        S_new = self.S.copy()
+        for x in range(WORLD_SIZE):
+            for y in range(WORLD_SIZE):
+                neighbors = []
+                for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+                    nx, ny = x+dx, y+dy
+                    if 0 <= nx < WORLD_SIZE and 0 <= ny < WORLD_SIZE:
+                        neighbors.append(self.S[nx,ny])
+                if neighbors:
+                    S_new[x,y] += 0.01 * (np.mean(neighbors, axis=0) - self.S[x,y])
+        self.S = S_new
+        A_new = self.A.copy()
+        for x in range(WORLD_SIZE):
+            for y in range(WORLD_SIZE):
+                neighbors = []
+                for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+                    nx, ny = x+dx, y+dy
+                    if 0 <= nx < WORLD_SIZE and 0 <= ny < WORLD_SIZE:
+                        neighbors.append(self.A[nx,ny])
+                if neighbors:
+                    mean_A = np.mean(neighbors, axis=0)
+                    A_new[x,y] += 0.015 * (mean_A - self.A[x,y])
+        self.A = A_new
+
+# =============================================================================
+# INIT
+# =============================================================================
+
+field = Field()
+agents = [Agent(i, (stable_hash(i,"px")%WORLD_SIZE, stable_hash(i,"py")%WORLD_SIZE)) for i in range(N_AGENTS)]
+
+coherence_hist, field_norm_hist, flow_hist = [], [], []
+scar_hist, vortex_count_hist, vortex_mass_hist = [], [], []
+energy_hist = []
+lineage_count_hist = []
+dominance_hist = []
+biome_diversity_hist = []
+
+# =============================================================================
+# SIMULATION LOOP
+# =============================================================================
+
+for t in range(STEPS):
+    field._regen_field_energy()
+    field.diffuse()
+    field._vortex_lifecycle()
+
+    cell_states = {}
+    for a in agents:
+        pos = tuple(a.pos)
+        if pos not in cell_states:
+            cell_states[pos] = []
+        cell_states[pos].append(a.state.copy())
+
+    for a in agents:
+        x_state = a.state.copy()
+        pos = tuple(a.pos)
+        local_states = cell_states.get(pos, [])
+        dom = field.get_smoothed_dominant_eigenvector(*pos)
+        norm_s = np.linalg.norm(x_state)
+        in_res = (norm_s > 1e-8) and (abs(np.dot(x_state, dom) / norm_s) > RESONANCE_THRESHOLD)
+        dx = field.apply(pos, x_state)
+        x_state = x_state + dx
+        noise = np.array([sh_randn(a.id, t, i) for i in range(STATE_DIM)])
+        x_state += NOISE * noise
+        norm_x = np.linalg.norm(x_state)
+        if norm_x > 0:
+            x_state *= np.exp(-0.01 * norm_x)
+        if not np.isfinite(x_state).all():
+            x_state = np.array([sh_randn(a.id, t+1, i) for i in range(STATE_DIM)]) * 0.1
+        if in_res:
+            field.update_resonance(pos, x_state, local_states)
+        else:
+            field.update_normal(pos, np.outer(x_state, x_state), local_states)
+        a.state = x_state
+        a.move(t, field)
+
+    states = np.array([a.state for a in agents])
+    coh = np.mean(np.linalg.norm(states, axis=1))
+    norms, flows, scars = [], [], 0
+    for x in range(WORLD_SIZE):
+        for y in range(WORLD_SIZE):
+            M = field.S[x,y] + field.A[x,y]
+            if np.isfinite(M).all():
+                n = np.linalg.norm(M)
+                norms.append(n)
+                flows.append(np.linalg.norm(field.A[x,y]))
+                if n > 18.0:
+                    scars += 1
+
+    coherence_hist.append(coh)
+    field_norm_hist.append(np.mean(norms) if norms else 0)
+    flow_hist.append(np.mean(flows) if flows else 0)
+    scar_hist.append(scars)
+    vortex_count_hist.append(len(field.vortices))
+    total_mass = sum(v.mass for v in field.vortices)
+    vortex_mass_hist.append(total_mass)
+    energy_hist.append(np.mean(field.field_energy))
+
+    lineages = {}
+    total_cells = 0
+    for v in field.vortices:
+        if v.lineage_id not in lineages:
+            lineages[v.lineage_id] = {'cells': 0, 'mass': 0, 'count': 0, 'max_gen': 0, 'biome_dist': np.zeros(N_BIOMES)}
+        lineages[v.lineage_id]['cells'] += len(v.cells)
+        lineages[v.lineage_id]['mass'] += v.mass
+        lineages[v.lineage_id]['count'] += 1
+        lineages[v.lineage_id]['max_gen'] = max(lineages[v.lineage_id]['max_gen'], v.generation)
+        for (x,y) in v.cells:
+            lineages[v.lineage_id]['biome_dist'][field.biome_map[x,y]] += 1
+        total_cells += len(v.cells)
+
+    lineage_count_hist.append(len(lineages))
+    if total_cells > 0:
+        dom_cells = max(lineages.values(), key=lambda x: x['cells'])['cells'] if lineages else 0
+        dominance_hist.append(dom_cells / total_cells)
+    else:
+        dominance_hist.append(0)
+
+    div = 0
+    for lid, data in lineages.items():
+        dist = data['biome_dist'] / (data['cells'] + 1e-9)
+        ent = -np.sum(dist * np.log(dist + 1e-9))
+        div += ent
+    biomes_div = div / len(lineages) if lineages else 0
+    biome_diversity_hist.append(biomes_div)
+
+    if t % 500 == 0:
+        print(f"Step {t:4d} | Coh:{coh:.3f} | |M|:{field_norm_hist[-1]:.3f} | Flow:{flow_hist[-1]:.4f} | Scars:{scars} | Vorts:{len(field.vortices)} | Lines:{len(lineages)} | Dom:{dominance_hist[-1]:.2f} | BioDiv:{biomes_div:.2f}")
+
+# =============================================================================
+# PLOT
+# =============================================================================
+
+fig, axes = plt.subplots(3, 5, figsize=(24, 14))
+ax = axes.flatten()
+
+ax[0].plot(coherence_hist); ax[0].set_title("Coherence"); ax[0].grid(True)
+ax[1].plot(field_norm_hist, color='orange'); ax[1].set_title("Field Norm |M|"); ax[1].grid(True)
+ax[2].plot(flow_hist, color='green'); ax[2].set_title("Flow |A|"); ax[2].grid(True)
+ax[3].plot(vortex_count_hist, color='purple'); ax[3].set_title("Vortex Count"); ax[3].grid(True)
+ax[4].plot(energy_hist, color='cyan'); ax[4].set_title("Mean Field Energy"); ax[4].grid(True)
+
+dom_map = np.zeros((WORLD_SIZE, WORLD_SIZE))
+for x in range(WORLD_SIZE):
+    for y in range(WORLD_SIZE):
+        M = field.S[x,y] + field.A[x,y]
+        if np.isfinite(M).all():
+            try:
+                eigvals, eigvecs = np.linalg.eig(M)
+                idx = np.argmax(np.real(eigvals))
+                dom_map[x,y] = np.real(eigvecs[0, idx])
+            except:
+                pass
+im0 = ax[5].imshow(dom_map.T, origin='lower', cmap='RdBu', vmin=-0.8, vmax=0.8)
+ax[5].set_title("Dominant Eigenvector"); plt.colorbar(im0, ax=ax[5])
+
+energy = np.array([[np.linalg.norm(field.S[x,y]+field.A[x,y]) for y in range(WORLD_SIZE)] for x in range(WORLD_SIZE)])
+im1 = ax[6].imshow(energy.T, origin='lower', cmap='plasma')
+ax[6].set_title("Field Energy"); plt.colorbar(im1, ax=ax[6])
+
+vmap = field.vortex_grid.astype(float)
+vmap[vmap == 0] = np.nan
+im2 = ax[7].imshow(vmap.T, origin='lower', cmap='tab20', interpolation='nearest')
+ax[7].set_title(f"Vortices (n={len(field.vortices)})"); plt.colorbar(im2, ax=ax[7])
+
+ax[8].plot(lineage_count_hist, color='brown'); ax[8].set_title("Lineage Count"); ax[8].grid(True)
+ax[9].plot(dominance_hist, color='red'); ax[9].set_title("Dominant Lineage Share"); ax[9].grid(True)
+
+biome_rgb = np.zeros((WORLD_SIZE, WORLD_SIZE, 3))
+for x in range(WORLD_SIZE):
+    for y in range(WORLD_SIZE):
+        b = field.biome_map[x,y]
+        if b == 0: biome_rgb[x,y] = [0.8, 1.0, 0.8]
+        elif b == 1: biome_rgb[x,y] = [0.8, 0.8, 0.8]
+        else: biome_rgb[x,y] = [1.0, 0.8, 0.8]
+ax[10].imshow(biome_rgb.transpose(1,0,2), origin='lower')
+ax[10].set_title("Biomes (green=fertile, gray=neutral, red=harsh)")
+
+im3 = ax[11].imshow(field.eco_memory.T, origin='lower', cmap='YlOrBr')
+ax[11].set_title("Eco Memory (life traces)"); plt.colorbar(im3, ax=ax[11])
+
+ax[12].plot(biome_diversity_hist, color='teal'); ax[12].set_title("Biome Diversity (entropy)"); ax[12].grid(True)
+
+if field.vortices:
+    lineage_prefs = {}
+    for v in field.vortices:
+        lid = v.lineage_id
+        if lid not in lineage_prefs:
+            lineage_prefs[lid] = []
+        lineage_prefs[lid].append(v.genome['niche_preference'])
+    for i, (lid, prefs) in enumerate(lineage_prefs.items()):
+        if i >= 5: break
+        avg_pref = np.mean(prefs, axis=0)
+        ax[13].bar(np.arange(N_BIOMES) + i*0.15, avg_pref, width=0.15, label=f"L{lid}")
+    ax[13].set_title("Lineage Niche Preferences"); ax[13].set_xticks(range(N_BIOMES)); ax[13].legend(fontsize=7)
+
+ax[14].axis('off')
+
+plt.tight_layout(); plt.show()
+
+print("\n=== Final Stats v34 ===")
+print(f"Coherence: {coherence_hist[-1]:.3f}")
+print(f"Field norm: {field_norm_hist[-1]:.3f}")
+print(f"Flow: {flow_hist[-1]:.4f}")
+print(f"Scars: {scar_hist[-1]}")
+print(f"Active vortices: {len(field.vortices)}")
+print(f"Lineages: {lineage_count_hist[-1]}")
+print(f"Dominance: {dominance_hist[-1]:.2f}")
+print(f"Biome diversity: {biome_diversity_hist[-1]:.2f}")
+if field.vortices:
+    lineages = {}
+    for v in field.vortices:
+        lid = v.lineage_id
+        if lid not in lineages:
+            lineages[lid] = {'count':0, 'mass':0, 'cells':0, 'max_gen':0, 'prefs':[]}
+        lineages[lid]['count'] += 1
+        lineages[lid]['mass'] += v.mass
+        lineages[lid]['cells'] += len(v.cells)
+        lineages[lid]['max_gen'] = max(lineages[lid]['max_gen'], v.generation)
+        lineages[lid]['prefs'].append(v.genome['niche_preference'])
+    print("\nTop lineages with niche preferences:")
+    for lid, stats in sorted(lineages.items(), key=lambda x: x[1]['cells'], reverse=True)[:3]:
+        avg_pref = np.mean(stats['prefs'], axis=0)
+        print(f" Lineage {lid}: vortices={stats['count']}, cells={stats['cells']}, mass={stats['mass']:.1f}, max_gen={stats['max_gen']}")
+        print(f"   Niche prefs: fertile={avg_pref[0]:.2f}, neutral={avg_pref[1]:.2f}, harsh={avg_pref[2]:.2f}")
